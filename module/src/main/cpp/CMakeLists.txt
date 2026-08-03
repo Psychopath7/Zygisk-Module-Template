@@ -27,18 +27,26 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${C_FLAGS} ${CXX_FLAGS}")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
-# cpp 폴더 내 파일만 사용
 add_library(${MODULE_NAME} SHARED
     main.cpp
-    dobby.cpp
 )
 
+# dobby header 위치 (dobby.h가 cpp 폴더에 있으면 이대로 OK)
 target_include_directories(${MODULE_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+# ABI별 libdobby.a 경로 (네가 이미 쓰던 위치로 맞춰)
+# 예: module/src/main/cpp/lib/arm64-v8a/libdobby.a
+add_library(dobby STATIC IMPORTED)
+set_target_properties(dobby PROPERTIES
+    IMPORTED_LOCATION
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib/${ANDROID_ABI}/libdobby.a
+)
+
 target_link_libraries(${MODULE_NAME}
     log
+    dobby
 )
 
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
