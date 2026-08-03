@@ -21,7 +21,7 @@ using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 
 // ===== 사용자 설정 =====
-static const char* kTargetPkg = "com.your.target.app";   // 실제 패키지명으로 변경
+static const char* kTargetPkg = "com.gear2.growslayer";   // 실제 패키지명으로 변경
 static const uintptr_t kOffsetLoadMetadata = 0x4463454;  // 네가 가진 오프셋
 static const uint32_t kMetadataMagic = 0xAF1BB1FA;
 static const char* kTracePath = "/data/local/tmp/myzygisk_trace.log";
