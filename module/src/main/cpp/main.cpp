@@ -159,23 +159,17 @@ void* my_android_dlopen_ext(const char* filename, int flags, const void* extinfo
         LOGI2("base=0x%" PRIxPTR ", target=0x%" PRIxPTR, base, target);
         dump_mapping_for_addr(target);
 
-        // readable probe
-        volatile uint32_t probe = *(volatile uint32_t*)target;
-        LOGI2("target first dword=0x%08x", probe);
+        // [중요] 당분간 아래 2개 금지
+        // volatile uint32_t probe = *(volatile uint32_t*)target;
+        // DobbyHook((void*)target, ...);
 
-        int hr = DobbyHook((void*)target, (void*)my_LoadMetaDataFile, (void**)&orig_LoadMetaDataFile);
-        if (hr == 0) {  // success
-            g_il2cpp_hooked = true;
-            LOGI2("DobbyHook success @0x%" PRIxPTR, target);
-
-            FILE* ok = fopen("/data/local/tmp/myzygisk_hooked.flag", "w");
-            if (ok) {
-                fprintf(ok, "HOOKED pid=%d base=0x%" PRIxPTR " target=0x%" PRIxPTR "\n", getpid(), base, target);
-                fclose(ok);
-            }
-        } else {
-            LOGE2("DobbyHook failed code=%d @0x%" PRIxPTR, hr, target);
+        FILE* ok = fopen("/data/local/tmp/myzygisk_addr_ok.flag", "w");
+        if (ok) {
+            fprintf(ok, "ADDR_OK pid=%d base=0x%" PRIxPTR " target=0x%" PRIxPTR "\n", getpid(), base, target);
+            fclose(ok);
         }
+
+        g_il2cpp_hooked = true; // 중복 로그 방지용
     }
 
     return handle;
