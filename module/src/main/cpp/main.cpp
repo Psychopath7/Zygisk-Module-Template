@@ -1,5 +1,5 @@
 #include <sys/types.h>  // NDK 컴파일 오류 해결용
-#include <zygisk.hpp>
+#include "zygisk.hpp"
 #include <android/log.h>
 #include <dlfcn.h>
 #include <string.h>
