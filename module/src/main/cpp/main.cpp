@@ -1,30 +1,84 @@
-/* Copyright 2022-2023 John "topjohnwu" Wu
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
- * REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
- * AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
- * INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
- * LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
- * OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
- * PERFORMANCE OF THIS SOFTWARE.
- */
-
-#include <cstdlib>
-#include <unistd.h>
-#include <fcntl.h>
+#include <zygisk.hpp>
 #include <android/log.h>
+#include <dlfcn.h>
+#include <string.h>
+#include "dobby.h"
 
-#include "zygisk.hpp"
+#define LOG_TAG "MyZygiskModule"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
-using zygisk::ServerSpecializeArgs;
 
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "MyModule", __VA_ARGS__)
+// --- 1. 유틸리티: 프로세스 메모리에서 모듈의 베이스 주소 구하기 ---
+uintptr_t get_module_base(const char* module_name) {
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp) {
+        LOGE("[!] /proc/self/maps 파일을 열 수 없습니다.");
+        return 0; 
+    }
 
+    char line[512];
+    uintptr_t base_addr = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, module_name)) {
+            base_addr = (uintptr_t)strtoull(line, NULL, 16);
+            break; 
+        }
+    }
+
+    fclose(fp);
+    return base_addr;
+}
+
+// --- 2. 후킹할 타겟 함수(LoadMetaDataFile) 원본 포인터 및 가짜 함수 ---
+typedef void* (*LoadMetaDataFile_t)(const char* path);
+LoadMetaDataFile_t orig_LoadMetaDataFile = nullptr;
+
+void* my_LoadMetaDataFile(const char* path) {
+    LOGI("[!] my_LoadMetaDataFile 실행됨! 경로: %s", path);
+    
+    // 원본 로직 실행
+    void* result = orig_LoadMetaDataFile(path); 
+    
+    LOGI("[!] LoadMetaDataFile 반환값(retval): %p", result);
+    return result;
+}
+
+// --- 3. android_dlopen_ext 후킹 (libil2cpp.so 메모리 로드 감지용) ---
+typedef void* (*android_dlopen_ext_t)(const char*, int, const void*);
+android_dlopen_ext_t orig_android_dlopen_ext = nullptr;
+
+void* my_android_dlopen_ext(const char* filename, int flags, const void* extinfo) {
+    // 라이브러리가 정상적으로 메모리에 올라가도록 원본 함수 먼저 실행
+    void* handle = orig_android_dlopen_ext(filename, flags, extinfo);
+    
+    if (filename != nullptr && strstr(filename, "libil2cpp.so")) {
+        LOGI("[!] libil2cpp.so 메모리 로드 감지됨!");
+        
+        // 베이스 주소 구하기
+        uintptr_t base_addr = get_module_base("libil2cpp.so");
+        
+        if (base_addr != 0) {
+            // 요청하신 오프셋 0x4463454 적용
+            uintptr_t target_addr = base_addr + 0x4463454;
+            
+            LOGI("[!] libil2cpp.so Base: 0x%" PRIxPTR, base_addr);
+            LOGI("[!] Target Offset Address: 0x%" PRIxPTR, target_addr);
+            
+            // Dobby를 사용하여 타겟 메모리 주소 인라인 후킹
+            DobbyHook((void*)target_addr, (void*)my_LoadMetaDataFile, (void**)&orig_LoadMetaDataFile);
+            LOGI("[!] 성공적으로 후킹되었습니다!");
+        } else {
+            LOGE("[!] libil2cpp.so 베이스 주소를 찾을 수 없습니다.");
+        }
+    }
+    
+    return handle;
+}
+
+// --- 4. Zygisk 모듈 메인 클래스 ---
 class MyModule : public zygisk::ModuleBase {
 public:
     void onLoad(Api *api, JNIEnv *env) override {
@@ -32,48 +86,29 @@ public:
         this->env = env;
     }
 
-    void preAppSpecialize(AppSpecializeArgs *args) override {
-        // Use JNI to fetch our process name
-        const char *process = env->GetStringUTFChars(args->nice_name, nullptr);
-        preSpecialize(process);
-        env->ReleaseStringUTFChars(args->nice_name, process);
-    }
-
-    void preServerSpecialize(ServerSpecializeArgs *args) override {
-        preSpecialize("system_server");
+    void postAppSpecialize(const AppSpecializeArgs *args) override {
+        const char* process_name = env->GetStringUTFChars(args->nice_name, nullptr);
+        
+        // ⚠️ 주의: 본인이 실습하는 앱의 패키지명으로 "com.your.target.app"을 수정해야 합니다.
+        if (process_name != nullptr && strstr(process_name, "com.gear2.growslayer")) {
+            LOGI("[!] 타겟 앱(%s) 감지됨. dlopen 후킹 대기...", process_name);
+            
+            // 시스템 dlopen 함수 주소를 찾아 후킹 준비
+            void* dlopen_addr = DobbySymbolResolver(nullptr, "android_dlopen_ext");
+            if (dlopen_addr) {
+                DobbyHook(dlopen_addr, (void*)my_android_dlopen_ext, (void**)&orig_android_dlopen_ext);
+            } else {
+                LOGE("[!] android_dlopen_ext 주소를 찾을 수 없습니다.");
+            }
+        }
+        
+        env->ReleaseStringUTFChars(args->nice_name, process_name);
     }
 
 private:
     Api *api;
     JNIEnv *env;
-
-    void preSpecialize(const char *process) {
-        // Demonstrate connecting to to companion process
-        // We ask the companion for a random number
-        unsigned r = 0;
-        int fd = api->connectCompanion();
-        read(fd, &r, sizeof(r));
-        close(fd);
-        LOGD("process=[%s], r=[%u]\n", process, r);
-
-        // Since we do not hook any functions, we should let Zygisk dlclose ourselves
-        api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-    }
-
 };
 
-static int urandom = -1;
-
-static void companion_handler(int i) {
-    if (urandom < 0) {
-        urandom = open("/dev/urandom", O_RDONLY);
-    }
-    unsigned r;
-    read(urandom, &r, sizeof(r));
-    LOGD("companion r=[%u]\n", r);
-    write(i, &r, sizeof(r));
-}
-
-// Register our module class and the companion handler function
+// Zygisk 모듈 등록 매크로
 REGISTER_ZYGISK_MODULE(MyModule)
-REGISTER_ZYGISK_COMPANION(companion_handler)
