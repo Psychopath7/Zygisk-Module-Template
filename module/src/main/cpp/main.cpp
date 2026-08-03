@@ -1,3 +1,5 @@
+#include <sys/types.h>
+#include <sys/stat.h>
 #include "zygisk.hpp"
 #include <android/log.h>
 #include <pthread.h>
