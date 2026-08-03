@@ -1,11 +1,16 @@
+#include <sys/types.h>  // NDK 컴파일 오류 해결용
 #include <zygisk.hpp>
 #include <android/log.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <inttypes.h>
 #include "dobby.h"
 
 #define LOG_TAG "MyZygiskModule"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
