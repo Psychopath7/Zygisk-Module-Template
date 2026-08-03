@@ -14,21 +14,23 @@
 #include <setjmp.h>
 
 #define LOG_TAG "MyZygiskModule"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 
 // ===== 사용자 설정 =====
-static const char* kTargetPkg = "com.gear2.growslayer";   // 실제 패키지명으로 변경
-static const uintptr_t kOffsetLoadMetadata = 0x4463454;  // 네가 가진 오프셋
+static const char* kTargetPkg = "com.gear2.growslayer";   // 실제 패키지명
+static const uintptr_t kOffsetLoadMetadata = 0x4463454;  // 네 오프셋
 static const uint32_t kMetadataMagic = 0xAF1BB1FA;
+
 static const char* kTracePath = "/data/local/tmp/myzygisk_trace.log";
 static const char* kDumpPath  = "/data/local/tmp/global-metadata.dump";
 static const char* kOkPath    = "/data/local/tmp/myzygisk_dump_ok.flag";
 
-// ===== 전역 상태 =====
+// true면 정확/접두 매칭 대신 모든 proc에서 1회 시도(디버그용)
+static const bool kDebugTryAnyProcess = false;
+
+// ===== 전역 =====
 static volatile bool g_worker_started = false;
 static JNIEnv* g_env = nullptr;
 
@@ -94,31 +96,29 @@ static bool addr_in_maps(uintptr_t addr) {
     return false;
 }
 
-// ===== SIGSEGV 가드 (직접 호출 보호용) =====
+// ===== 안전 호출(SIGSEGV 가드) =====
 static sigjmp_buf g_jmpbuf;
 static struct sigaction g_old_segv;
 static volatile sig_atomic_t g_segv_guard = 0;
 
 static void segv_handler(int sig) {
     (void)sig;
-    if (g_segv_guard) {
-        siglongjmp(g_jmpbuf, 1);
-    }
+    if (g_segv_guard) siglongjmp(g_jmpbuf, 1);
 }
 
 template <typename Fn>
-static void* safe_call_metadata(Fn fn, const char* arg, bool* crashed) {
+static void* safe_call(Fn fn, const char* arg, bool* crashed) {
     if (crashed) *crashed = false;
 
-    struct sigaction sa {};
+    struct sigaction sa{};
     sa.sa_handler = segv_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-
     sigaction(SIGSEGV, &sa, &g_old_segv);
-    g_segv_guard = 1;
 
+    g_segv_guard = 1;
     void* ret = nullptr;
+
     if (sigsetjmp(g_jmpbuf, 1) == 0) {
         ret = fn(arg);
     } else {
@@ -140,6 +140,7 @@ static bool dump_fixed_size(const void* p, size_t size) {
     }
     size_t wr = fwrite(p, 1, size, out);
     fclose(out);
+
     if (wr != size) {
         TLOGE("write dump failed: %zu/%zu", wr, size);
         return false;
@@ -147,13 +148,12 @@ static bool dump_fixed_size(const void* p, size_t size) {
     return true;
 }
 
-// 네가 가정한 시그니처
+// 네가 추정한 함수 시그니처
 typedef void* (*LoadMetaDataLike_t)(const char*);
 
 static void* worker_thread(void*) {
     TLOGI("worker started");
 
-    // 1) libil2cpp 로드 대기
     uintptr_t base = 0;
     for (int i = 0; i < 300; ++i) { // 최대 30초
         base = get_module_base_rx("libil2cpp.so");
@@ -168,54 +168,53 @@ static void* worker_thread(void*) {
 
     uintptr_t fn_addr = base + kOffsetLoadMetadata;
     TLOGI("libil2cpp base=0x%" PRIxPTR, base);
-    TLOGI("target fn=0x%" PRIxPTR " (base+0x%" PRIxPTR ")", fn_addr, kOffsetLoadMetadata);
+    TLOGI("target fn=0x%" PRIxPTR, fn_addr);
 
     if (!addr_in_maps(fn_addr)) {
         TLOGE("target fn not in maps");
         return nullptr;
     }
 
-    // 2) 함수 직접 호출 (보호 가드 적용)
     auto fn = reinterpret_cast<LoadMetaDataLike_t>(fn_addr);
+
     bool crashed = false;
     TLOGI("calling fn(\"global-metadata.dat\")");
-    void* meta = safe_call_metadata(fn, "global-metadata.dat", &crashed);
+    void* meta = safe_call(fn, "global-metadata.dat", &crashed);
 
     if (crashed) {
-        TLOGE("fn call crashed (likely wrong prototype/offset)");
+        TLOGE("fn call crashed (wrong offset/prototype likely)");
         return nullptr;
     }
 
     TLOGI("fn returned meta=%p", meta);
     if (!meta) {
-        TLOGE("meta ptr is null");
+        TLOGE("meta is null");
         return nullptr;
     }
 
-    // 3) magic 확인
     uint32_t magic = *(uint32_t*)meta;
     TLOGI("meta magic=0x%08x", magic);
 
     if (magic != kMetadataMagic) {
-        TLOGE("magic mismatch (maybe encrypted/transformed)");
+        TLOGE("magic mismatch (encrypted/transformed 가능)");
         return nullptr;
     }
 
-    // 4) 4MB 우선 덤프
-    size_t dump_sz = 0x400000;
-    if (!dump_fixed_size(meta, dump_sz)) {
+    // 4MB 우선 덤프
+    const size_t dumpSize = 0x400000;
+    if (!dump_fixed_size(meta, dumpSize)) {
         TLOGE("dump failed");
         return nullptr;
     }
 
     FILE* ok = fopen(kOkPath, "w");
     if (ok) {
-        fprintf(ok, "OK pid=%d base=0x%" PRIxPTR " fn=0x%" PRIxPTR " meta=%p dump=%s size=%zu\n",
-                getpid(), base, fn_addr, meta, kDumpPath, dump_sz);
+        fprintf(ok, "OK pid=%d base=0x%" PRIxPTR " fn=0x%" PRIxPTR " meta=%p size=%zu\n",
+                getpid(), base, fn_addr, meta, dumpSize);
         fclose(ok);
     }
 
-    TLOGI("dump success: %s (%zu bytes)", kDumpPath, dump_sz);
+    TLOGI("dump success: %s (%zu bytes)", kDumpPath, dumpSize);
     return nullptr;
 }
 
@@ -228,15 +227,32 @@ public:
     }
 
     void postAppSpecialize(const AppSpecializeArgs* args) override {
-        if (!args || !args->nice_name || !g_env) return;
+        if (!args || !args->nice_name || !g_env) {
+            TLOGE("postAppSpecialize invalid args/env");
+            return;
+        }
 
         const char* proc = g_env->GetStringUTFChars(args->nice_name, nullptr);
-        if (!proc) return;
+        if (!proc) {
+            TLOGE("GetStringUTFChars failed");
+            return;
+        }
 
-        // exact + sub-process 모두 대응 (com.pkg / com.pkg:xxx)
-        bool match = (strncmp(proc, kTargetPkg, strlen(kTargetPkg)) == 0);
+        // 핵심: 실제 프로세스명 로깅
+        TLOGI("postAppSpecialize proc=%s", proc);
 
-        if (match && !g_worker_started) {
+        bool matched = false;
+
+        if (kDebugTryAnyProcess) {
+            matched = true;
+        } else {
+            // exact 또는 sub-process(com.pkg:xxx) 허용
+            size_t n = strlen(kTargetPkg);
+            if (strcmp(proc, kTargetPkg) == 0) matched = true;
+            else if (strncmp(proc, kTargetPkg, n) == 0 && proc[n] == ':') matched = true;
+        }
+
+        if (matched && !g_worker_started) {
             g_worker_started = true;
             TLOGI("target matched: %s", proc);
             TLOGI("spawning worker");
