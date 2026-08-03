@@ -1,79 +1,239 @@
-/* Copyright 2022-2023 John "topjohnwu" Wu
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
- * REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
- * AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
- * INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
- * LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
- * OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
- * PERFORMANCE OF THIS SOFTWARE.
- */
-
-#include <cstdlib>
-#include <unistd.h>
-#include <fcntl.h>
+#include <sys/types.h>
+#include <zygisk.hpp>
 #include <android/log.h>
+#include <dlfcn.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stdarg.h>
+#include <time.h>
+#include <unistd.h>
+#include "dobby.h"
 
-#include "zygisk.hpp"
+#define LOG_TAG "MyZygiskModule"
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
-using zygisk::ServerSpecializeArgs;
 
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "MyModule", __VA_ARGS__)
+static bool g_il2cpp_hooked = false;
+static bool g_target_seen = false;
+static FILE* g_fp = nullptr;
+
+// ---------- robust logger ----------
+static void open_log_file_once() {
+    if (g_fp) return;
+    // root/magisk 환경에서 보통 접근 가능
+    g_fp = fopen("/data/local/tmp/myzygisk_trace.log", "a");
+}
+
+static void close_log_file() {
+    if (g_fp) {
+        fflush(g_fp);
+        fclose(g_fp);
+        g_fp = nullptr;
+    }
+}
+
+static void vlog_all(const char* level, const char* fmt, va_list ap) {
+    char buf[2048];
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+
+    // 1) logcat
+    int prio = ANDROID_LOG_INFO;
+    if (!strcmp(level, "E")) prio = ANDROID_LOG_ERROR;
+    __android_log_print(prio, LOG_TAG, "%s", buf);
+
+    // 2) stderr
+    fprintf(stderr, "[%s][%s] %s\n", LOG_TAG, level, buf);
+    fflush(stderr);
+
+    // 3) file
+    open_log_file_once();
+    if (g_fp) {
+        time_t t = time(nullptr);
+        fprintf(g_fp, "[%ld][pid:%d][%s] %s\n", (long)t, getpid(), level, buf);
+        fflush(g_fp);
+    }
+}
+
+static void LOGI2(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vlog_all("I", fmt, ap);
+    va_end(ap);
+}
+static void LOGE2(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vlog_all("E", fmt, ap);
+    va_end(ap);
+}
+
+// ---------- helpers ----------
+uintptr_t get_module_base(const char* module_name) {
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) {
+        LOGE2("failed to open /proc/self/maps");
+        return 0;
+    }
+
+    char line[1024];
+    uintptr_t start = 0, end = 0;
+    char perm[8] = {0};
+    char path[512] = {0};
+
+    while (fgets(line, sizeof(line), fp)) {
+        int n = sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %7s %*s %*s %*s %511s",
+                       &start, &end, perm, path);
+        if (n >= 4) {
+            if (strstr(path, module_name) && strstr(perm, "r-x")) {
+                fclose(fp);
+                return start;
+            }
+        }
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+// target 주소가 maps 어느 구간인지 덤프
+static void dump_mapping_for_addr(uintptr_t addr) {
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) {
+        LOGE2("dump_mapping_for_addr: maps open fail");
+        return;
+    }
+
+    char line[1024];
+    uintptr_t start = 0, end = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &start, &end) == 2) {
+            if (addr >= start && addr < end) {
+                LOGI2("addr 0x%" PRIxPTR " in mapping: %s", addr, line);
+                fclose(fp);
+                return;
+            }
+        }
+    }
+    fclose(fp);
+    LOGE2("addr 0x%" PRIxPTR " not found in maps", addr);
+}
+
+typedef void* (*LoadMetaDataFile_t)(const char* path);
+static LoadMetaDataFile_t orig_LoadMetaDataFile = nullptr;
+
+void* my_LoadMetaDataFile(const char* path) {
+    LOGI2("my_LoadMetaDataFile called: %s", path ? path : "(null)");
+    void* ret = orig_LoadMetaDataFile ? orig_LoadMetaDataFile(path) : nullptr;
+    LOGI2("LoadMetaDataFile ret=%p", ret);
+
+    // 성공 마커 파일 (확실한 증거)
+    FILE* ok = fopen("/data/local/tmp/myzygisk_hit.flag", "w");
+    if (ok) {
+        fprintf(ok, "HIT pid=%d path=%s ret=%p\n", getpid(), path ? path : "(null)", ret);
+        fclose(ok);
+    }
+    return ret;
+}
+
+typedef void* (*android_dlopen_ext_t)(const char*, int, const void*);
+static android_dlopen_ext_t orig_android_dlopen_ext = nullptr;
+
+void* my_android_dlopen_ext(const char* filename, int flags, const void* extinfo) {
+    void* handle = orig_android_dlopen_ext(filename, flags, extinfo);
+
+    if (!g_il2cpp_hooked && filename && strstr(filename, "libil2cpp.so")) {
+        LOGI2("libil2cpp load detected: %s", filename);
+
+        uintptr_t base = get_module_base("libil2cpp.so");
+        if (!base) {
+            LOGE2("libil2cpp base not found");
+            return handle;
+        }
+
+        uintptr_t target = base + 0x4463454;
+        LOGI2("base=0x%" PRIxPTR ", target=0x%" PRIxPTR, base, target);
+        dump_mapping_for_addr(target);
+
+        // readable probe
+        volatile uint32_t probe = *(volatile uint32_t*)target;
+        LOGI2("target first dword=0x%08x", probe);
+
+        int hr = DobbyHook((void*)target, (void*)my_LoadMetaDataFile, (void**)&orig_LoadMetaDataFile);
+        if (hr == RT_SUCCESS) {
+            g_il2cpp_hooked = true;
+            LOGI2("DobbyHook success @0x%" PRIxPTR, target);
+
+            FILE* ok = fopen("/data/local/tmp/myzygisk_hooked.flag", "w");
+            if (ok) {
+                fprintf(ok, "HOOKED pid=%d base=0x%" PRIxPTR " target=0x%" PRIxPTR "\n", getpid(), base, target);
+                fclose(ok);
+            }
+        } else {
+            LOGE2("DobbyHook failed code=%d @0x%" PRIxPTR, hr, target);
+        }
+    }
+
+    return handle;
+}
 
 class MyModule : public zygisk::ModuleBase {
 public:
-    void onLoad(Api *api, JNIEnv *env) override {
-        this->api = api;
-        this->env = env;
+    ~MyModule() override {
+        close_log_file();
     }
 
-    void preAppSpecialize(AppSpecializeArgs *args) override {
-        // Use JNI to fetch our process name
-        const char *process = env->GetStringUTFChars(args->nice_name, nullptr);
-        preSpecialize(process);
-        env->ReleaseStringUTFChars(args->nice_name, process);
+    void onLoad(Api* api, JNIEnv* env) override {
+        api_ = api;
+        env_ = env;
+        LOGI2("onLoad called");
     }
 
-    void preServerSpecialize(ServerSpecializeArgs *args) override {
-        preSpecialize("system_server");
+    void postAppSpecialize(const AppSpecializeArgs* args) override {
+        if (!args || !args->nice_name) {
+            LOGE2("postAppSpecialize: args or nice_name null");
+            return;
+        }
+
+        const char* process_name = env_->GetStringUTFChars(args->nice_name, nullptr);
+        if (!process_name) {
+            LOGE2("GetStringUTFChars failed");
+            return;
+        }
+
+        // 여기 패키지명 반드시 수정
+        if (strstr(process_name, "com.your.target.app")) {
+            g_target_seen = true;
+            LOGI2("target process detected: %s", process_name);
+
+            FILE* ok = fopen("/data/local/tmp/myzygisk_target_seen.flag", "w");
+            if (ok) {
+                fprintf(ok, "TARGET pid=%d process=%s\n", getpid(), process_name);
+                fclose(ok);
+            }
+
+            void* sym = DobbySymbolResolver(nullptr, "android_dlopen_ext");
+            if (!sym) {
+                LOGE2("android_dlopen_ext symbol not found");
+            } else {
+                int hr = DobbyHook(sym, (void*)my_android_dlopen_ext, (void**)&orig_android_dlopen_ext);
+                if (hr == RT_SUCCESS) {
+                    LOGI2("hook android_dlopen_ext success");
+                } else {
+                    LOGE2("hook android_dlopen_ext failed code=%d", hr);
+                }
+            }
+        }
+
+        env_->ReleaseStringUTFChars(args->nice_name, process_name);
     }
 
 private:
-    Api *api;
-    JNIEnv *env;
-
-    void preSpecialize(const char *process) {
-        // Demonstrate connecting to to companion process
-        // We ask the companion for a random number
-        unsigned r = 0;
-        int fd = api->connectCompanion();
-        read(fd, &r, sizeof(r));
-        close(fd);
-        LOGD("process=[%s], r=[%u]\n", process, r);
-
-        // Since we do not hook any functions, we should let Zygisk dlclose ourselves
-        api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-    }
-
+    Api* api_ = nullptr;
+    JNIEnv* env_ = nullptr;
 };
 
-static int urandom = -1;
-
-static void companion_handler(int i) {
-    if (urandom < 0) {
-        urandom = open("/dev/urandom", O_RDONLY);
-    }
-    unsigned r;
-    read(urandom, &r, sizeof(r));
-    LOGD("companion r=[%u]\n", r);
-    write(i, &r, sizeof(r));
-}
-
-// Register our module class and the companion handler function
 REGISTER_ZYGISK_MODULE(MyModule)
-REGISTER_ZYGISK_COMPANION(companion_handler)
