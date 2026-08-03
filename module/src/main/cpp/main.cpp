@@ -15,7 +15,7 @@
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 
-static const char* kTargetPkg = "com.your.target.app"; // 실제 패키지명
+static const char* kTargetPkg = "com.gear2.growslayer"; // 실제 패키지명
 static const char* kTracePath = "/data/local/tmp/myzygisk_trace.log";
 
 static JNIEnv* g_env = nullptr;
