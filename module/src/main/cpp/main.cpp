@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdint.h>
 #include "dobby.h"
 
 #define LOG_TAG "MyZygiskModule"
@@ -163,7 +164,7 @@ void* my_android_dlopen_ext(const char* filename, int flags, const void* extinfo
         LOGI2("target first dword=0x%08x", probe);
 
         int hr = DobbyHook((void*)target, (void*)my_LoadMetaDataFile, (void**)&orig_LoadMetaDataFile);
-        if (hr == RT_SUCCESS) {
+        if (hr == 0) {  // success
             g_il2cpp_hooked = true;
             LOGI2("DobbyHook success @0x%" PRIxPTR, target);
 
@@ -182,7 +183,7 @@ void* my_android_dlopen_ext(const char* filename, int flags, const void* extinfo
 
 class MyModule : public zygisk::ModuleBase {
 public:
-    ~MyModule() override {
+    ~MyModule() {
         close_log_file();
     }
 
@@ -205,7 +206,7 @@ public:
         }
 
         // 여기 패키지명 반드시 수정
-        if (strstr(process_name, "com.your.target.app")) {
+        if (strstr(process_name, "com.gear2.growslayer")) {
             g_target_seen = true;
             LOGI2("target process detected: %s", process_name);
 
@@ -220,7 +221,7 @@ public:
                 LOGE2("android_dlopen_ext symbol not found");
             } else {
                 int hr = DobbyHook(sym, (void*)my_android_dlopen_ext, (void**)&orig_android_dlopen_ext);
-                if (hr == RT_SUCCESS) {
+                if (hr == 0) {  // success
                     LOGI2("hook android_dlopen_ext success");
                 } else {
                     LOGE2("hook android_dlopen_ext failed code=%d", hr);
