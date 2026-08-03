@@ -1,14 +1,17 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include "zygisk.hpp"
+
 #include <android/log.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <stdarg.h>
+#include <signal.h>
+#include <setjmp.h>
 
 #define LOG_TAG "MyZygiskModule"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -18,36 +21,38 @@ using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 
 // ===== 사용자 설정 =====
-static const char* kTargetPkg = "com.gear2.growslayer"; // 반드시 실제 패키지명으로 변경
-static const uintptr_t kOffsetLoadMetadata = 0x4463454; // 네가 확인한 오프셋
-static const uint32_t kMetadataMagic = 0xAF1BB1FA;      // global-metadata.dat magic
-static const char* kDumpPath = "/data/local/tmp/global-metadata.dump";
+static const char* kTargetPkg = "com.your.target.app";   // 실제 패키지명으로 변경
+static const uintptr_t kOffsetLoadMetadata = 0x4463454;  // 네가 가진 오프셋
+static const uint32_t kMetadataMagic = 0xAF1BB1FA;
 static const char* kTracePath = "/data/local/tmp/myzygisk_trace.log";
+static const char* kDumpPath  = "/data/local/tmp/global-metadata.dump";
+static const char* kOkPath    = "/data/local/tmp/myzygisk_dump_ok.flag";
 
-// ===== 상태 =====
+// ===== 전역 상태 =====
 static volatile bool g_worker_started = false;
 static JNIEnv* g_env = nullptr;
 
-// ===== 유틸 =====
-static void tracef(const char* level, const char* fmt, ...) {
-    char buf[2048];
+// ===== 로깅 =====
+static void tracef(const char* lv, const char* fmt, ...) {
+    char msg[2048];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
-    int prio = (!strcmp(level, "E")) ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO;
-    __android_log_print(prio, LOG_TAG, "%s", buf);
+    int prio = (!strcmp(lv, "E")) ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO;
+    __android_log_print(prio, LOG_TAG, "%s", msg);
 
     FILE* fp = fopen(kTracePath, "a");
     if (fp) {
-        fprintf(fp, "[%s][pid:%d] %s\n", level, getpid(), buf);
+        fprintf(fp, "[%s][pid:%d] %s\n", lv, getpid(), msg);
         fclose(fp);
     }
 }
 #define TLOGI(...) tracef("I", __VA_ARGS__)
 #define TLOGE(...) tracef("E", __VA_ARGS__)
 
+// ===== maps 유틸 =====
 static uintptr_t get_module_base_rx(const char* module_name) {
     FILE* fp = fopen("/proc/self/maps", "r");
     if (!fp) return 0;
@@ -75,147 +80,142 @@ static bool addr_in_maps(uintptr_t addr) {
     if (!fp) return false;
 
     char line[1024];
-    uintptr_t start = 0, end = 0;
+    uintptr_t s = 0, e = 0;
     while (fgets(line, sizeof(line), fp)) {
-        if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &start, &end) == 2) {
-            if (addr >= start && addr < end) {
+        if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &s, &e) == 2) {
+            if (addr >= s && addr < e) {
                 TLOGI("addr 0x%" PRIxPTR " in map: %s", addr, line);
                 fclose(fp);
                 return true;
             }
         }
     }
-
     fclose(fp);
     return false;
 }
 
-// 간단한 안전 읽기(완전한 SIGSEGV 방지는 아님)
-// 크래시 위험 줄이려고 maps 확인 후 최소 read만 수행
-static bool read_u32_checked(uintptr_t addr, uint32_t* out) {
-    if (!out) return false;
-    if (!addr_in_maps(addr)) return false;
-    *out = *(volatile uint32_t*)addr;
-    return true;
+// ===== SIGSEGV 가드 (직접 호출 보호용) =====
+static sigjmp_buf g_jmpbuf;
+static struct sigaction g_old_segv;
+static volatile sig_atomic_t g_segv_guard = 0;
+
+static void segv_handler(int sig) {
+    (void)sig;
+    if (g_segv_guard) {
+        siglongjmp(g_jmpbuf, 1);
+    }
 }
 
-// metadata 구조를 모르는 상황이므로, magic부터 찾고
-// 최대 max_scan 범위 내에서 "그럴듯한 끝"을 추정하여 덤프
-static bool dump_metadata_blob(uint8_t* base_ptr, size_t max_scan) {
-    if (!base_ptr || max_scan < 0x1000) return false;
+template <typename Fn>
+static void* safe_call_metadata(Fn fn, const char* arg, bool* crashed) {
+    if (crashed) *crashed = false;
 
-    // 1) magic 확인
-    uint32_t magic = *(uint32_t*)base_ptr;
-    if (magic != kMetadataMagic) {
-        TLOGE("magic mismatch: got=0x%08x expect=0x%08x", magic, kMetadataMagic);
-        return false;
+    struct sigaction sa {};
+    sa.sa_handler = segv_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    sigaction(SIGSEGV, &sa, &g_old_segv);
+    g_segv_guard = 1;
+
+    void* ret = nullptr;
+    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+        ret = fn(arg);
+    } else {
+        if (crashed) *crashed = true;
     }
 
-    TLOGI("metadata magic matched: 0x%08x", magic);
+    g_segv_guard = 0;
+    sigaction(SIGSEGV, &g_old_segv, nullptr);
+    return ret;
+}
 
-    // 2) version 읽기 (일반적으로 offset 4)
-    uint32_t version = *(uint32_t*)(base_ptr + 4);
-    TLOGI("metadata version guess: %u", version);
-
-    // 3) 보수적으로 덤프 크기 추정
-    // 완전한 파서는 아니므로 "무리하지 않는 크기"로 잘라 덤프
-    // 필요 시 나중에 확장 가능
-    size_t dump_size = 0x400000; // 4MB 기본
-    if (dump_size > max_scan) dump_size = max_scan;
-    if (dump_size < 0x1000) return false;
-
+// ===== 덤프 =====
+static bool dump_fixed_size(const void* p, size_t size) {
+    if (!p || size == 0) return false;
     FILE* out = fopen(kDumpPath, "wb");
     if (!out) {
-        TLOGE("failed to open dump path: %s", kDumpPath);
+        TLOGE("open dump failed: %s", kDumpPath);
         return false;
     }
-
-    size_t wr = fwrite(base_ptr, 1, dump_size, out);
+    size_t wr = fwrite(p, 1, size, out);
     fclose(out);
-
-    if (wr != dump_size) {
-        TLOGE("dump write failed: %zu/%zu", wr, dump_size);
+    if (wr != size) {
+        TLOGE("write dump failed: %zu/%zu", wr, size);
         return false;
     }
-
-    TLOGI("dump success: %s (%zu bytes)", kDumpPath, dump_size);
     return true;
 }
 
-// 핵심: 오프셋 함수 호출 시도
-// 주의: 시그니처 불일치 시 크래시 가능.
-// 네 정보 기반으로 (const char*) -> void* 가정.
-typedef void* (*LoadMetaDataLike_t)(const char* path);
+// 네가 가정한 시그니처
+typedef void* (*LoadMetaDataLike_t)(const char*);
 
 static void* worker_thread(void*) {
     TLOGI("worker started");
 
-    // libil2cpp 로드 대기 (최대 20초)
+    // 1) libil2cpp 로드 대기
     uintptr_t base = 0;
-    for (int i = 0; i < 200; ++i) {
+    for (int i = 0; i < 300; ++i) { // 최대 30초
         base = get_module_base_rx("libil2cpp.so");
         if (base) break;
-        usleep(100000); // 100ms
+        usleep(100000);
     }
 
     if (!base) {
-        TLOGE("libil2cpp base not found (timeout)");
+        TLOGE("timeout: libil2cpp.so not found");
         return nullptr;
     }
 
     uintptr_t fn_addr = base + kOffsetLoadMetadata;
     TLOGI("libil2cpp base=0x%" PRIxPTR, base);
-    TLOGI("target fn addr=0x%" PRIxPTR " (base+0x%" PRIxPTR ")", fn_addr, kOffsetLoadMetadata);
+    TLOGI("target fn=0x%" PRIxPTR " (base+0x%" PRIxPTR ")", fn_addr, kOffsetLoadMetadata);
 
     if (!addr_in_maps(fn_addr)) {
-        TLOGE("target addr not in maps");
+        TLOGE("target fn not in maps");
         return nullptr;
     }
 
-    // 함수 시작 바이트 4개 확인(디버깅용)
-    uint32_t head = 0;
-    if (read_u32_checked(fn_addr, &head)) {
-        TLOGI("target first dword=0x%08x", head);
-    } else {
-        TLOGE("failed to read target first dword");
-    }
+    // 2) 함수 직접 호출 (보호 가드 적용)
+    auto fn = reinterpret_cast<LoadMetaDataLike_t>(fn_addr);
+    bool crashed = false;
+    TLOGI("calling fn(\"global-metadata.dat\")");
+    void* meta = safe_call_metadata(fn, "global-metadata.dat", &crashed);
 
-    // 함수 직접 호출 시도 (위험 구간)
-    // 앱 크래시 시 이 부분을 비활성화하고 다른 오프셋/시그니처 재검증 필요
-    LoadMetaDataLike_t fn = reinterpret_cast<LoadMetaDataLike_t>(fn_addr);
-
-    TLOGI("calling target fn(\"global-metadata.dat\") ...");
-    void* meta_ptr = fn("global-metadata.dat");
-    TLOGI("target fn returned meta_ptr=%p", meta_ptr);
-
-    if (!meta_ptr) {
-        TLOGE("meta_ptr is null");
+    if (crashed) {
+        TLOGE("fn call crashed (likely wrong prototype/offset)");
         return nullptr;
     }
 
-    // magic 검사
-    uint32_t mg = *(uint32_t*)meta_ptr;
-    TLOGI("meta_ptr magic=0x%08x", mg);
-
-    if (mg != kMetadataMagic) {
-        TLOGE("not plain metadata (maybe encrypted/transformed)");
+    TLOGI("fn returned meta=%p", meta);
+    if (!meta) {
+        TLOGE("meta ptr is null");
         return nullptr;
     }
 
-    // 덤프 (최대 16MB 스캔 한도)
-    if (!dump_metadata_blob((uint8_t*)meta_ptr, 0x1000000)) {
+    // 3) magic 확인
+    uint32_t magic = *(uint32_t*)meta;
+    TLOGI("meta magic=0x%08x", magic);
+
+    if (magic != kMetadataMagic) {
+        TLOGE("magic mismatch (maybe encrypted/transformed)");
+        return nullptr;
+    }
+
+    // 4) 4MB 우선 덤프
+    size_t dump_sz = 0x400000;
+    if (!dump_fixed_size(meta, dump_sz)) {
         TLOGE("dump failed");
         return nullptr;
     }
 
-    // 성공 마커
-    FILE* ok = fopen("/data/local/tmp/myzygisk_dump_ok.flag", "w");
+    FILE* ok = fopen(kOkPath, "w");
     if (ok) {
-        fprintf(ok, "OK pid=%d base=0x%" PRIxPTR " fn=0x%" PRIxPTR " meta=%p dump=%s\n",
-                getpid(), base, fn_addr, meta_ptr, kDumpPath);
+        fprintf(ok, "OK pid=%d base=0x%" PRIxPTR " fn=0x%" PRIxPTR " meta=%p dump=%s size=%zu\n",
+                getpid(), base, fn_addr, meta, kDumpPath, dump_sz);
         fclose(ok);
     }
 
+    TLOGI("dump success: %s (%zu bytes)", kDumpPath, dump_sz);
     return nullptr;
 }
 
@@ -233,10 +233,13 @@ public:
         const char* proc = g_env->GetStringUTFChars(args->nice_name, nullptr);
         if (!proc) return;
 
-        // 정확 일치 권장
-        if (strcmp(proc, kTargetPkg) == 0 && !g_worker_started) {
+        // exact + sub-process 모두 대응 (com.pkg / com.pkg:xxx)
+        bool match = (strncmp(proc, kTargetPkg, strlen(kTargetPkg)) == 0);
+
+        if (match && !g_worker_started) {
             g_worker_started = true;
             TLOGI("target matched: %s", proc);
+            TLOGI("spawning worker");
 
             pthread_t th;
             if (pthread_create(&th, nullptr, worker_thread, nullptr) == 0) {
