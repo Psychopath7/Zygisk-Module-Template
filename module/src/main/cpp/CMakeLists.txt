@@ -28,11 +28,32 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LINKER_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 
 add_library(${MODULE_NAME} SHARED
-        main.cpp)
-        
-target_link_libraries(${MODULE_NAME} log)
+    main.cpp
+)
+
+# ---- include paths ----
+# 1) zygisk.hpp 위치
+# 2) dobby.h 위치
+target_include_directories(${MODULE_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/dobby/include
+)
+
+# ---- import Dobby prebuilt ----
+# arm64-v8a 기준. (x86_64 필요 없으면 안 넣어도 됨)
+# libdobby.a를 쓰는 경우
+add_library(dobby STATIC IMPORTED)
+set_target_properties(dobby PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/dobby/libs/${ANDROID_ABI}/libdobby.a
+)
+
+target_link_libraries(${MODULE_NAME}
+    dobby
+    log
+)
 
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_custom_command(TARGET ${MODULE_NAME} POST_BUILD
-            COMMAND ${CMAKE_STRIP} --strip-all --remove-section=.comment "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/lib${MODULE_NAME}.so")
+        COMMAND ${CMAKE_STRIP} --strip-all --remove-section=.comment "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/lib${MODULE_NAME}.so")
 endif ()
