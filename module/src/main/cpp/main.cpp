@@ -1,3 +1,10 @@
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <jni.h>
+#include "zygisk.hpp"
+#include <android/log.h>
+#include <string>
+#include <atomic>
 #include <jni.h>
 #include <zygisk.hpp>
 #include <android/log.h>
