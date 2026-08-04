@@ -11,7 +11,7 @@
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 
-static constexpr const char *kTargetPackage = "YOUR.TARGET.PACKAGE"; 
+static constexpr const char *kTargetPackage = "com.gear2.growslayer"; 
 // 예: "com.example.game"
 
 static constexpr const char *kTargetActivityClass =
